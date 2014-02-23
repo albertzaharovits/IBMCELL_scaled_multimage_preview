@@ -1,0 +1,115 @@
+Cell TV Channel Preview
+
+Albert Zaharovits albert.zaharovits@gmail.com
+21.4.2013
+
+  IBM CELL architecture project
+
+  video stream have to be preprocessed into png images!
+
+  16 streams of pnm images (converted from 16 avi streams) with a resolution
+  of 640x384 are amassed togheter to form one single stream with the same 
+  resolution, the preview stream of the 16 streams. Therefore each original
+  "stream" is scaled down 4 times in both sizes; see sample output file: 
+  sample_output.png
+
+  This is just for demonstration purpose, it was a course assignment.
+  The avi streams have to be pre-converted to pnm images using a tool such
+  as ffmpeg.
+
+  Run command:
+  ./serial <input_path> <output_path> <num_frames> <num_spu_threads>
+
+  where:
+     <input_path> should contain the folder structure: /stream<1-16>/image%.pnm
+     <output_path> output directory for the preview frames
+     <num_frames> total count for frames
+     <num_spu_threads> 1-16 threads, for benchmarking purposes
+
+  There are 4 techniques employed, and their performances ploted in the 
+  performance_results.pdf file. There is just one ppu thread. It starts all
+  spu_threads (with SPE_EVENT_OUT_INTR_MBOX set) and reads all
+  16 streams frame by frame and then sends each correponding image header 
+  (containing pointers in main storage). Each SPU thread receives (blocking)
+  each frame's image header pointer with spu_read_in_mbox(), and then
+  initiates a synchronous mfc_get into local storage. Then each SPU thread
+  requests fragments of it's corresponding stream, scales them, then sends
+  them back in the main storage, in the preview image. When all fragments
+  of an image have been processes the spu_threads signals completion:
+  data[0] = DONE;
+  spu_write_out_intr_mbox(data[0]);
+  and waits the next image's header pointer.
+  The ppu_thread sends another image to each spu_thread when all spu_threads
+  have reported completion for the previous image (all streams have been
+  processed for the current frame)
+    total_ev = 0;
+    while(total_ev < num_spu_threads){
+      num_ev = spe_event_wait(event_handler, events_received, num_spu_threads, -1);
+      total_ev += num_ev;
+      for (j =0; j < num_ev; j++) {
+        if (events_received[j].events & SPE_EVENT_OUT_INTR_MBOX) {
+          spe_out_intr_mbox_read(events_received[j].spe, (unsigned int*) &data, 1, SPE_MBOX_ALL_BLOCKING);
+        }
+        else {
+          perror("Unexpected event\n");
+          exit(1);
+        }
+      }
+    }
+  All DMA requests originate from the SPU_threads.
+
+  Benchmarking results are obtained for different number of spu_threads,
+  different local storage buffer sizes and different dma request strategies:
+  using double buffer with/without dma_list transfer (for image data).
+  
+
+  process_image_simple
+    - each spu thread requests requests 4 lines from the global storage, 
+      compacts them into 1 short (quarter) line and puts it back. Every dma
+      get and put is blocked for complition.
+    - all speed-ups have this implementation as reference.
+	process_image_2lines
+    - similar to the previous implementation, just the input, output and 
+      temp buffers are doubled. The mfc operations are the same, with the
+      same size, tag and order; they are also duplicated.
+    - practically each mfc operation/buffer is doubled.
+		Performance analysis:
+		- best speed-up for 1 or 2 spu_threads.
+    - the DMA controller is able to fuse the double mfc operations, with the
+      same tag and succesive main storage addresses; however the scatter in
+      the output buffer cannot be fused.
+    - the speed-up is decreasing when the number of spu_threads increases. this      is caused because the DMA queue gets filled by the mfc_get requests.
+
+	process_image_double
+    - starting from the previous implementation, the double buffer technique
+      is implemented; instead of calling mfc_get and mfc_put simultaneously
+      for the 2 buffers, they are ordered alternatively, such that processing
+      of one buffer can overlap the transfer in the other buffer.
+		Performance analysis:
+		- the speed-up is relatively small, compared to that of 
+      process_image_2lines, but no less than 8%
+    - the interesting fact here is that, although the buffers have the same
+      sizes, the speed-up is significantly smaller
+    - the order and the different tags prevents the DMA controller from
+      merging succesive transfers in one tranfer
+    - another fact is that the transfer size is not sufficiently large
+      to overlap computation, and the overhead of waitag is comparable to 
+      the computation
+    - because there is no waitag immediatly after the call to mfc_put
+      the scatters into main storage can be partially fused by the DMA
+      controller
+
+	process_image_dmalist
+    - increases size of all buffers 4 times (maximum restricted by local
+      storage size); it scales 8 rows at a time, so the input buffers are
+      32 full rows in size
+    - due to the increased buffers, the memory transfers have to be 
+      carried out using dma lists with the call to spu_mfcdma32, because
+      the transfers size excedes 16KB
+		Performance analysis:
+    - this is the fastest implementation, speed-up around 25% (maximum 26%)
+    - buffers are large enough to overlap computation with transfer in the
+      other buffer
+    - using DMA lists also decreases the penalty of the scater in the output
+      preview image, because the DMA controller has more opportunities to
+      fuse transfers (destination addresses consecutive in main storage)
